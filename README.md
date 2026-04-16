@@ -1,6 +1,6 @@
 # DanWebSocket (Swift)
 
-A Swift client library for the **DanProtocol v3.5** real-time state synchronization protocol. Lightweight, zero-dependency, built on Apple's `URLSessionWebSocketTask`.
+A Swift client **and server** library for the **DanProtocol v3.5** real-time state synchronization protocol. Lightweight, zero-dependency, built on Apple's `URLSessionWebSocketTask` (client) and `Network.framework` (server).
 
 [![Swift 5.9+](https://img.shields.io/badge/Swift-5.9+-orange.svg)](https://swift.org)
 [![Platforms](https://img.shields.io/badge/Platforms-iOS%2015%20%7C%20macOS%2012-blue.svg)](https://developer.apple.com)
@@ -8,22 +8,25 @@ A Swift client library for the **DanProtocol v3.5** real-time state synchronizat
 
 ## What is DanWebSocket?
 
-DanWebSocket connects your iOS/macOS app to a DanProtocol server over WebSocket. The server pushes state updates in a compact binary format, and the client automatically maintains a synchronized copy of that state. Think of it as a real-time key-value store that syncs across devices.
+DanWebSocket connects your iOS/macOS app to a DanProtocol server over WebSocket, or lets you **run a DanProtocol server** natively in Swift. The protocol pushes state updates in a compact binary format, and clients automatically maintain a synchronized copy of that state.
 
 **Why use this?**
 
-- **Real-time dashboards** — display live sensor data, stock prices, game scores
-- **Collaborative apps** — shared state between multiple users/devices
-- **IoT monitoring** — push device telemetry to mobile apps with minimal bandwidth
-- **Live feeds** — scrolling data with efficient array shift operations
+- **Real-time dashboards** -- display live sensor data, stock prices, game scores
+- **Collaborative apps** -- shared state between multiple users/devices
+- **IoT monitoring** -- push device telemetry to mobile apps with minimal bandwidth
+- **Live feeds** -- scrolling data with efficient array shift operations
+- **Embedded servers** -- run a DanProtocol server directly inside your Swift app
 
 **Key features:**
 
+- **Client + Server** in a single package
 - Binary protocol: a boolean update is ~13 bytes (vs ~30+ for JSON)
-- Auto-reconnection with exponential backoff
+- 4 server modes: broadcast, principal, session_topic, session_principal_topic
+- Auto-reconnection with exponential backoff (client)
 - Topic-based subscriptions with parameters
 - Heartbeat-based connection health monitoring
-- Zero external dependencies (uses Foundation's URLSessionWebSocketTask)
+- Zero external dependencies (uses Foundation + Network.framework)
 - Full Swift concurrency support
 
 ## Installation
@@ -43,7 +46,7 @@ Or in Xcode: **File > Add Package Dependencies** and paste:
 https://github.com/justdancecloud/danws_swift.git
 ```
 
-## Quick Start
+## Quick Start -- Client
 
 ### Basic Connection
 
@@ -90,24 +93,173 @@ client.connect()
 let client = DanWebSocketClient(url: "ws://example.com/ws")
 
 client.onReady {
-    // Subscribe to a topic with parameters
     client.subscribe("dashboard", params: ["roomId": "abc123"])
 }
 
-// Access topic-scoped data
 let handle = client.topic("dashboard")
 handle.onReceive { key, value in
     print("Dashboard.\(key) = \(value ?? "nil")")
 }
 handle.onUpdate { topic in
-    // Fires once per batch (efficient for UI updates)
     print("Dashboard updated, keys: \(topic.keys)")
 }
 
 client.connect()
 ```
 
-### SwiftUI Integration
+## Quick Start -- Server
+
+### Broadcast Mode
+
+All connected clients see the same shared state.
+
+```swift
+import DanWebSocket
+
+let server = DanWebSocketServer(options: ServerOptions(
+    port: 8080,
+    mode: .broadcast
+))
+
+server.set("score", 0)
+server.set("status", "waiting")
+
+server.onConnection { session in
+    print("Client connected: \(session.id)")
+}
+
+// Update state -- all clients receive the change automatically
+Timer.scheduledTimer(withTimeInterval: 1.0, repeats: true) { _ in
+    let current = (server.get("score") as? Int) ?? 0
+    server.set("score", current + 1)
+}
+```
+
+### Principal Mode
+
+Each user (principal) has isolated state. Multiple sessions from the same principal share their state.
+
+```swift
+let server = DanWebSocketServer(options: ServerOptions(
+    port: 8080,
+    mode: .principal
+))
+
+server.enableAuthorization(true, timeout: 5000)
+
+server.onAuthorize { clientUuid, token in
+    // Validate the token and assign a principal
+    if token == "alice-token" {
+        server.authorize(clientUuid, token: token, principal: "alice")
+    } else {
+        server.reject(clientUuid, reason: "Invalid token")
+    }
+}
+
+server.onConnection { session in
+    let ptx = server.principal(session.principal ?? "default")
+    ptx.set("welcome", "Hello, \(session.principal ?? "user")!")
+    ptx.set("loginTime", Date().timeIntervalSince1970)
+}
+```
+
+### Topic Mode
+
+Clients subscribe to named topics with parameters. The server responds with per-topic data.
+
+```swift
+let server = DanWebSocketServer(options: ServerOptions(
+    port: 8080,
+    mode: .sessionTopic
+))
+
+server.topic.onSubscribe { session, handle in
+    print("Client \(session.id) subscribed to \(handle.name) with params: \(handle.params)")
+
+    // Set topic-scoped data
+    handle.payload.set("title", "Live Dashboard")
+    handle.payload.set("refreshRate", 1000)
+
+    // Start a repeating task
+    handle.setDelayedTask(ms: 1000)
+    handle.setCallback { event, topic, session in
+        if event == .delayedTask {
+            topic.payload.set("timestamp", Date().timeIntervalSince1970)
+        }
+    }
+}
+
+server.topic.onUnsubscribe { session, handle in
+    print("Client \(session.id) unsubscribed from \(handle.name)")
+}
+```
+
+### ArraySync (Ring Buffer)
+
+Efficient server-side array with fixed capacity. Oldest items are evicted when full.
+
+```swift
+let server = DanWebSocketServer(options: ServerOptions(
+    port: 8080,
+    mode: .broadcast
+))
+
+let logs = server.array("logs", capacity: 100)
+
+// Push items -- when capacity is reached, oldest items are removed
+logs.push("Server started")
+logs.push("Client connected")
+logs.push("Processing request...")
+
+// Access items
+print("Total: \(logs.count)")
+print("Latest: \(logs.get(logs.count - 1) ?? "nil")")
+
+// Convert to array
+let allLogs = logs.toArray()
+```
+
+### Authorization
+
+```swift
+let server = DanWebSocketServer(options: ServerOptions(
+    port: 8080,
+    mode: .principal
+))
+
+server.enableAuthorization(true, timeout: 5000)
+
+server.onAuthorize { clientUuid, token in
+    // Your auth logic here
+    validateToken(token) { isValid, username in
+        if isValid {
+            server.authorize(clientUuid, token: token, principal: username)
+        } else {
+            server.reject(clientUuid, reason: "Invalid credentials")
+        }
+    }
+}
+```
+
+### Metrics
+
+```swift
+let m = server.metrics()
+print("Active sessions: \(m.activeSessions)")
+print("Pending auth: \(m.pendingSessions)")
+print("Principals: \(m.principalCount)")
+print("Frames in: \(m.framesIn)")
+print("Frames out: \(m.framesOut)")
+```
+
+### Connection Limits
+
+```swift
+server.setMaxConnections(100)    // 0 = unlimited
+server.setMaxFramesPerSec(60)    // 0 = unlimited
+```
+
+## SwiftUI Integration
 
 ```swift
 import SwiftUI
@@ -188,57 +340,42 @@ struct DashboardView: View {
 }
 ```
 
-### Batch Updates (Efficient Rendering)
-
-```swift
-// onReceive fires per-key (N times per batch)
-client.onReceive { key, value in
-    // Fine-grained: per-key update
-}
-
-// onUpdate fires once per server flush (1 time per batch)
-client.onUpdate { state in
-    // Batch-level: update UI once with all current values
-    let temp = state["sensor.temperature"]
-    let humid = state["sensor.humidity"]
-    updateUI(temp: temp, humid: humid)
-}
-```
-
 ## Configuration
 
-### Reconnection Options
+### Reconnection Options (Client)
 
 ```swift
 let options = ClientOptions(
     reconnect: ReconnectOptions(
-        enabled: true,       // Auto-reconnect on disconnect
-        maxRetries: 10,      // 0 = unlimited
-        baseDelay: 1.0,      // Initial delay (seconds)
-        maxDelay: 30.0,      // Maximum delay (seconds)
+        enabled: true,
+        maxRetries: 10,
+        baseDelay: 1.0,
+        maxDelay: 30.0,
         backoffMultiplier: 2.0,
-        jitter: true         // Randomize delay to prevent thundering herd
+        jitter: true
     ),
-    debug: true  // Enable debug logging
+    debug: true
 )
 
 let client = DanWebSocketClient(url: "ws://localhost:8080/ws", options: options)
 ```
 
-### Reconnection Events
+### Server Options
 
 ```swift
-client.onReconnecting { attempt, delay in
-    print("Reconnecting... attempt \(attempt), waiting \(delay)s")
-}
-
-client.onReconnect {
-    print("Reconnected successfully!")
-}
-
-client.onReconnectFailed {
-    print("All reconnection attempts exhausted")
-}
+let server = DanWebSocketServer(options: ServerOptions(
+    port: 8080,
+    path: "/ws",
+    mode: .broadcast,
+    sessionTtl: 600_000,          // 10 min session TTL
+    principalEvictionTtl: 300_000, // 5 min before evicting idle principal data
+    debug: true,
+    flushIntervalMs: 100,
+    maxMessageSize: 1_048_576,    // 1 MB
+    maxValueSize: 65_536,         // 64 KB
+    maxConnections: 0,            // unlimited
+    maxFramesPerSec: 0            // unlimited
+))
 ```
 
 ## API Reference
@@ -259,7 +396,38 @@ client.onReconnectFailed {
 | `unsubscribe(_ topic:)` | Unsubscribe from a topic |
 | `topic(_ name:) -> TopicClientHandle` | Get scoped topic handle |
 
-### Events
+### DanWebSocketServer
+
+| Property/Method | Description |
+|---|---|
+| `mode: ServerMode` | Server operating mode |
+| `set(_ key:, _ value:)` | Set value (broadcast mode) |
+| `get(_ key:) -> Any?` | Get value (broadcast mode) |
+| `keys: [String]` | All keys (broadcast mode) |
+| `clear(_ key:)` | Clear key or all (broadcast mode) |
+| `array(_ key:, capacity:)` | Create ArraySync ring buffer |
+| `principal(_ name:) -> PrincipalTX` | Access principal state |
+| `enableAuthorization(_ enabled:, timeout:)` | Enable/disable auth |
+| `authorize(_ clientUuid:, token:, principal:)` | Accept auth request |
+| `reject(_ clientUuid:, reason:)` | Reject auth request |
+| `setMaxConnections(_ max:)` | Set connection limit |
+| `setMaxFramesPerSec(_ max:)` | Set frame rate limit |
+| `metrics() -> ServerMetrics` | Get server metrics |
+| `topic: TopicNamespace` | Topic event namespace |
+| `onConnection(_ cb:)` | New connection callback |
+| `onAuthorize(_ cb:)` | Auth request callback |
+| `close()` | Shut down server |
+
+### Server Modes
+
+| Mode | Description |
+|---|---|
+| `.broadcast` | All clients share one global state |
+| `.principal` | Per-user isolated state via principals |
+| `.sessionTopic` | Clients subscribe to topics with parameters |
+| `.sessionPrincipalTopic` | Topics + per-user principal state |
+
+### Events (Client)
 
 | Event | Callback | Description |
 |---|---|---|
