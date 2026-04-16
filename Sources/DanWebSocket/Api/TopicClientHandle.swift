@@ -85,11 +85,7 @@ public final class TopicClientHandle: @unchecked Sendable {
     /// Fire onReceive per-frame, mark dirty for batch onUpdate.
     func _notify(userKey: String, value: Any?) {
         for cb in onReceiveCallbacks {
-            do {
-                cb(userKey, value)
-            } catch {
-                log?("topic onReceive error", error)
-            }
+            cb(userKey, value)
         }
         dirty = true
     }
@@ -99,11 +95,7 @@ public final class TopicClientHandle: @unchecked Sendable {
         guard dirty, !onUpdateCallbacks.isEmpty else { return }
         dirty = false
         for cb in onUpdateCallbacks {
-            do {
-                cb(self)
-            } catch {
-                log?("topic onUpdate error", error)
-            }
+            cb(self)
         }
     }
 
